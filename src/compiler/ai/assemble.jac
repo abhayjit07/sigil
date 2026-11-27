@@ -269,6 +269,7 @@ def assemble(spec: RuleSet, wf: WorkflowView, vb: ViewBundle, name: str) -> Asse
         te: dict[str, any] = {};
         if td.sig { te["sig"] = td.sig; }
         if td.surface { te["surface"] = td.surface; }
+        if td.effects { te["effects"] = list(td.effects); }
         if td.serves { te["serves"] = list(td.serves); }
         if td.body.strip() { te["body"] = td.body; }
         if td.command.strip() { te["command"] = td.command; }

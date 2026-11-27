@@ -186,8 +186,8 @@ Parallel siblings share a race surface. The rule:
 - siblings may freely **read** fork-immutable shared state;
 - any multi-writer state is hoisted to the **orchestrator** and applied **at the barrier**.
 
-Declare it on the PARALLEL node: `isolation: { private_write, shared_read, orchestrator_owned }`.
-A PARALLEL with shared *writable* state and no isolation is a bug, not a design.
+Declare it on the PARALLEL node: `isolation: { private_write, shared_read, orchestrator_owned, worktree }`.
+A PARALLEL with shared *writable* state (shared carries or conflicting `effects`) and no isolation is a bug, not a design.
 
 ---
 

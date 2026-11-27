@@ -1841,3 +1841,99 @@ test "_record_items turns JSON-object strings back into records, and nothing els
     assert fn(['{"a": 1}']) == ['{"a": 1}'];          # SIGIL_RECORD_ITEMS=0
     # and the lowering wraps every list slot with it
 }
+
+test "effect-safe ILP stage lowers via flow/wait; conflicting writes stay sequential" {
+    ir_disjoint = """---
+name: test-disjoint
+description: Disjoint writes lower as a flow/wait stage.
+---
+agir_version: 0.1
+standalone: true
+shape: pipeline
+walker:
+  name: TestDisjointAgent
+  carries:
+    task: { type: str, role: input }
+    path_a: { type: str, produced_by: prep }
+    path_b: { type: str, produced_by: prep }
+    res_a: { type: str, produced_by: write_a }
+    res_b: { type: str, produced_by: write_b }
+nodes:
+  - id: prep
+    type: COMPUTE
+    owner: code
+    reads: [task]
+    writes: [path_a, path_b]
+  - id: write_a
+    type: ACT
+    owner: code
+    tool: write_file
+    reads: [path_a, task]
+    writes: [res_a]
+  - id: write_b
+    type: ACT
+    owner: code
+    tool: write_file
+    reads: [path_b, task]
+    writes: [res_b]
+  - id: done
+    type: RETURN
+    owner: code
+    reads: [res_a, res_b]
+    writes: []
+edges:
+  - { from: prep, to: write_a }
+  - { from: write_a, to: write_b }
+  - { from: write_b, to: done }
+tools:
+  prep_fn:
+    sig: "(task: str) -> str"
+    surface: COMPUTE
+    serves: [prep]
+    body: "return 'out.txt'"
+""";
+    src1 = transpile_ir(ir_disjoint, "test_disjoint");
+    assert "_ilp_f0 = flow " in src1, src1;
+    assert "_ilp_f1 = flow " in src1, src1;
+    assert "self._stage_done[\"write_b\"] = True;" in src1, src1;
+
+    ir_conflict = ir_disjoint.replace("path_b", "path_a");
+    src2 = transpile_ir(ir_conflict, "test_conflict");
+    assert "_ilp_f0 = flow " not in src2, src2;
+    assert "_stage_done" not in src2, src2;
+}
+
+test "PARALLEL with worktree/private_write isolation passes per-sibling workdir" {
+    ir_par = """---
+name: test-par-iso
+description: PARALLEL with worktree isolation passes workdir.
+---
+agir_version: 0.1
+standalone: true
+shape: pipeline
+walker:
+  name: TestParIsoAgent
+  carries:
+    task: { type: str, role: input }
+    items: { type: list[str], role: input }
+    out: { type: str, produced_by: fan }
+nodes:
+  - id: fan
+    type: PARALLEL
+    owner: code
+    reads: [items]
+    writes: [out]
+    concurrency:
+      isolation: worktree
+  - id: done
+    type: RETURN
+    owner: code
+    reads: [out]
+    writes: []
+edges:
+  - { from: fan, to: done }
+""";
+    src = transpile_ir(ir_par, "test_par_iso");
+    assert "workdir=f\".sigil_par_{_i}\"" in src, src;
+    assert "os.makedirs(self.workdir, exist_ok=True);" in src, src;
+}

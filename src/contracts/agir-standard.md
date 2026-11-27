@@ -29,6 +29,7 @@ Every node, regardless of family, has:
 | `doc` / `sem` | the node's semantic prompt (model nodes) | yes |
 | `tool` / `serves` | binds a Boundary/Code node to a tool (mechanism) | yes |
 | `autonomy.tools` | tool list a model node may ReAct over | optional |
+| `effects` | side-effect tags (`pure`, `fs:read(t)`, `fs:write(t)`, `net:read(t)`, `net:write(t)`, `env:read(t)`, `env:write(t)`, `proc:exec`) | optional |
 
 **Lowering invariant (all nodes):** a node reads its `reads` (bound per §4), does its
 type-specific work, assigns each `writes[i]` to `self.<carry>`, then emits OSP flow
@@ -88,7 +89,7 @@ self.<writes[0]> = [str(...) if str carry]  _<tool>(<reads bound per §4>);
   else back-edge. Never an unconditional self-`++>`.
 - **CALL:** `target` sub-IR → a `by llm()` sub-slot (or inlined sub-walker) that writes its carries.
 - **PARALLEL:** fan-out. Source = a `list[…]` `reads` carry (data-parallel: one sibling per
-  element) or a literal `concurrency.spawn: […]`; `isolation`: private_write / shared_read.
+  element) or a literal `concurrency.spawn: […]`; `isolation`: private_write / shared_read / worktree.
   Lowers to `flow`/`wait` over `root spawn <Sib>` — a self-contained sibling walker that runs
   one worker slot (`<node>_worker`, its own scoped `by llm`) per sub-task — with results joined
   back into the `writes` carry (a `list`, or newline-joined for a `str` carry). Real

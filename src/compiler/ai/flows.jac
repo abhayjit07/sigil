@@ -58,6 +58,7 @@ obj ToolDef {
     has name: str = "";
     has sig: str = "";
     has surface: str = "";
+    has effects: list[str] = [];
     has serves: list[str] = [];
     has body: str = "";
     has command: str = "";
@@ -66,6 +67,7 @@ obj ToolDef {
 sem ToolDef = "An owner=code tool. EMBODY, don't point: `body` carries the runnable implementation VERBATIM (or `command` the exact command line). A tool with neither is a prose-pointer — the standalone gate rejects it.";
 sem ToolDef.sig = "The tool signature, e.g. \"(inputs, out) -> path\".";
 sem ToolDef.surface = "OBSERVE (read -> data) or ACT (writes an effect/artifact).";
+sem ToolDef.effects = "Optional side-effect tags for concurrency analysis, e.g. ['fs:read(path)'], ['fs:write(out_path)'], ['net:read(url)'], ['proc:exec'], or ['pure'].";
 sem ToolDef.serves = "The node ids this tool fires for.";
 
 obj KnowledgeItem {

@@ -47,7 +47,10 @@ one instruction per obligation, executable instructions with code tools where th
 work is mechanical (bind a builtin by name with no body), semantic instructions
 only for genuine judgment, DELEGATE for an open-ended activity the skill leaves
 to the agent, carries typed across every model->code boundary, never a carry
-named with a bare tool-parameter name. A prohibition on where a value may flow,
+named with a bare tool-parameter name. Optionally declare `effects: [...]`
+(e.g. `fs:read(path)`, `fs:write(out)`, `net:read(url)`, `proc:exec`, `pure`)
+on custom tools or ACT/OBSERVE nodes so concurrency analysis knows which
+side-effects are disjoint. A prohibition on where a value may flow,
 or a required ordering, is ALSO stated under `constraints`.
 PROVENANCE IS MANDATORY: every node, tool and knowledge item MUST carry a
 `traces_to: [<rule ids>]` naming the frozen-set rule(s) it realizes — for EVERY
@@ -193,6 +196,7 @@ def _views_from_ir(ir_text: str) -> tuple[WorkflowView, ViewBundle] {
             if not isinstance(td, dict) { td = {}; }
             tools.append(ToolDef(
                 name=str(tname), sig=str(td.get("sig", "")), surface=str(td.get("surface", "")),
+                effects=_as_list(td.get("effects")),
                 serves=_as_list(td.get("serves")), body=str(td.get("body", "") or ""),
                 command=str(td.get("command", "") or ""), traces_to=str(td.get("traces_to", "") or "")
             ));
