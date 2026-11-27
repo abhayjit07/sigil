@@ -138,3 +138,93 @@ test "a list carry into a tool-backed code node is a DLP candidate" {
     assert len(c["dlp"]) == 1;
     assert "frames" in str(c["dlp"][0]);
 }
+
+test "same-target fs:write effects block ILP packing even with no shared carry" {
+    ir = {
+        "nodes": [
+            {"id": "a", "type": "COMPUTE", "owner": "code", "reads": [], "writes": ["out_path"]},
+            {"id": "b", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["out_path", "d1"], "writes": []},
+            {"id": "c", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["out_path", "d2"], "writes": []}
+        ],
+        "edges": [_e("a", "b"), _e("b", "c")],
+        "walker": {"carries": {}}
+    };
+    c = extract_concurrency(ir);
+    assert not [s for s in c["stages"] if len(s) >= 2];
+    assert not c["opportunities"];
+}
+
+test "disjoint fs:write effects allow ILP packing" {
+    ir = {
+        "nodes": [
+            {"id": "a", "type": "COMPUTE", "owner": "code", "reads": [], "writes": ["path_a", "path_b"]},
+            {"id": "b", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["path_a", "d1"], "writes": []},
+            {"id": "c", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["path_b", "d2"], "writes": []}
+        ],
+        "edges": [_e("a", "b"), _e("b", "c")],
+        "walker": {"carries": {}}
+    };
+    c = extract_concurrency(ir);
+    multi = [s for s in c["stages"] if len(s) >= 2];
+    assert len(multi) == 1;
+    assert list(multi[0]) == ["b", "c"];
+    assert len(c["opportunities"]) == 1;
+}
+
+test "shared fs:read effects allow ILP packing (read-shared)" {
+    ir = {
+        "nodes": [
+            {"id": "a", "type": "COMPUTE", "owner": "code", "reads": [], "writes": ["in_path"]},
+            {"id": "b", "type": "OBSERVE", "owner": "code", "tool": "read_file", "reads": ["in_path"], "writes": ["txt1"]},
+            {"id": "c", "type": "OBSERVE", "owner": "code", "tool": "grep", "reads": ["pat", "in_path"], "writes": ["hits"]}
+        ],
+        "edges": [_e("a", "b"), _e("b", "c")],
+        "walker": {"carries": {}}
+    };
+    c = extract_concurrency(ir);
+    multi = [s for s in c["stages"] if len(s) >= 2];
+    assert len(multi) == 1;
+    assert list(multi[0]) == ["b", "c"];
+}
+
+test "proc:exec effect conservatively serializes with fs:read" {
+    ir = {
+        "nodes": [
+            {"id": "a", "type": "ACT", "owner": "code", "tool": "run_command", "reads": ["cmd"], "writes": ["out"]},
+            {"id": "b", "type": "OBSERVE", "owner": "code", "tool": "read_file", "reads": ["in_path"], "writes": ["txt"]}
+        ],
+        "edges": [_e("a", "b")],
+        "walker": {"carries": {}}
+    };
+    c = extract_concurrency(ir);
+    assert not [s for s in c["stages"] if len(s) >= 2];
+}
+
+test "PARALLEL branches with conflicting fs:write effects raise G6_PAR unless isolated" {
+    ir_shared = {
+        "nodes": [
+            _n("s", ntype="PARALLEL"),
+            {"id": "b1", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["out_path", "x1"], "writes": ["r1"]},
+            {"id": "b2", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["out_path", "x2"], "writes": ["r2"]},
+            _n("j", ntype="RETURN", reads=["r1", "r2"])
+        ],
+        "edges": [_e("s", "b1"), _e("s", "b2"), _e("b1", "j"), _e("b2", "j")],
+        "walker": {"carries": {}}
+    };
+    c_shared = extract_concurrency(ir_shared);
+    assert len(c_shared["issues"]) == 1;
+    assert "conflicting side effects" in str(c_shared["issues"][0]);
+
+    ir_iso = {
+        "nodes": [
+            {"id": "s", "type": "PARALLEL", "owner": "code", "reads": [], "writes": [], "concurrency": {"isolation": "private_write"}},
+            {"id": "b1", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["out_path", "x1"], "writes": ["r1"]},
+            {"id": "b2", "type": "ACT", "owner": "code", "tool": "write_file", "reads": ["out_path", "x2"], "writes": ["r2"]},
+            _n("j", ntype="RETURN", reads=["r1", "r2"])
+        ],
+        "edges": [_e("s", "b1"), _e("s", "b2"), _e("b1", "j"), _e("b2", "j")],
+        "walker": {"carries": {}}
+    };
+    c_iso = extract_concurrency(ir_iso);
+    assert not c_iso["issues"];
+}

@@ -29,6 +29,7 @@ generated modules' PARALLEL lowering already uses that mechanism).
 """
 
 import from ...sigil_ais { canonical_opcode }
+import from .toolib { BUILTINS }
 
 # control-flow node types that end a linear chain (a BRANCH fans out to
 # EXCLUSIVE alternatives — never a parallel stage; PARALLEL is already parallel)
@@ -94,6 +95,150 @@ def _data_deps(ir: any) -> dict[str, any] {
         deps[nid] = dd;
     }
     return deps;
+}
+
+def _parse_effect(raw: str) -> dict[str, str] {
+    s = str(raw or "").strip();
+    if (not s) or (s == "pure") {
+        return {"kind": "pure", "mode": "none", "target": ""};
+    }
+    target = "*";
+    head = s;
+    if "(" in s and s.endswith(")") {
+        idx = s.index("(");
+        head = s[:idx].strip();
+        inner = s[idx + 1:-1].strip();
+        if inner { target = inner; }
+    }
+    if ":" in head {
+        parts = head.split(":", 1);
+        return {"kind": parts[0].strip().lower(), "mode": parts[1].strip().lower(), "target": target};
+    }
+    if head.lower() == "proc" {
+        return {"kind": "proc", "mode": "exec", "target": target};
+    }
+    return {"kind": head.lower(), "mode": "write", "target": target};
+}
+
+def _sig_params(sig: str) -> list[str] {
+    s = str(sig or "").strip();
+    if ("(" not in s) or (")" not in s) { return []; }
+    inner = s[s.index("(") + 1:s.index(")")];
+    out: list[str] = [];
+    for raw_p in inner.split(",") {
+        p = raw_p.strip();
+        if not p { continue; }
+        if "=" in p { p = p.split("=", 1)[0].strip(); }
+        if ":" in p { p = p.split(":", 1)[0].strip(); }
+        if p { out.append(p); }
+    }
+    return out;
+}
+
+def _bind_effect_target(target: str, param_names: list[str], reads: list[any]) -> str {
+    t = str(target or "").strip();
+    if (not t) or (t == "*") { return "*"; }
+    rlist = [str(r) for r in reads];
+    if t in rlist { return t; }
+    if t in param_names {
+        pidx = param_names.index(t);
+        if pidx < len(rlist) { return rlist[pidx]; }
+    }
+    if (len(rlist) == 1) and (t in ["path", "url", "file", "dir", "target", "channel"]) {
+        return rlist[0];
+    }
+    return t;
+}
+
+def _node_tool_meta(n: any, ir: any) -> dict[str, any] {
+    nid = str(_dct(n).get("id", ""));
+    tname = str(_dct(n).get("tool", "")).strip();
+    tools = _dct(_dct(ir).get("tools"));
+    if tname and (tname in tools) {
+        return _dct(tools.get(tname));
+    }
+    for kv in tools.items() {
+        tm = _dct(kv[1]);
+        if nid in _slist(tm.get("serves")) { return tm; }
+    }
+    if tname and (tname in BUILTINS) {
+        return _dct(BUILTINS.get(tname));
+    }
+    return {};
+}
+
+def _node_effects(n: any, ir: any) -> list[dict[str, str]] {
+    raw_effs = _slist(_dct(n).get("effects"));
+    if raw_effs {
+        return [_parse_effect(e) for e in raw_effs];
+    }
+    tmeta = _node_tool_meta(n, ir);
+    tool_effs = _slist(tmeta.get("effects"));
+    reads = _slist(_dct(n).get("reads"));
+    if tool_effs {
+        pnames = _sig_params(str(tmeta.get("sig", "")));
+        bound: list[dict[str, str]] = [];
+        for te in tool_effs {
+            pe = _parse_effect(te);
+            pe["target"] = _bind_effect_target(pe["target"], pnames, reads);
+            bound.append(pe);
+        }
+        return bound;
+    }
+    nt = _ntype(n);
+    if nt in ["SELECT", "EXTRACT", "MUTATE", "GENERATE", "DELEGATE"] {
+        au = _dct(_dct(n).get("autonomy"));
+        if _slist(au.get("tools")) {
+            return [{"kind": "proc", "mode": "exec", "target": "*"}];
+        }
+        return [{"kind": "pure", "mode": "none", "target": ""}];
+    }
+    if nt == "COMPUTE" {
+        return [{"kind": "pure", "mode": "none", "target": ""}];
+    }
+    if nt == "OBSERVE" {
+        surf = str(tmeta.get("surface", "")).upper();
+        if "NET" in surf {
+            return [{"kind": "net", "mode": "read", "target": "*"}];
+        }
+        return [{"kind": "fs", "mode": "read", "target": "*"}];
+    }
+    if nt == "ACT" {
+        surf = str(tmeta.get("surface", "")).upper();
+        if surf.startswith("OBSERVE") {
+            return [{"kind": "fs", "mode": "read", "target": "*"}];
+        }
+        return [{"kind": "fs", "mode": "write", "target": "*"}];
+    }
+    return [{"kind": "pure", "mode": "none", "target": ""}];
+}
+
+def _targets_alias(t1: str, t2: str) -> bool {
+    if (t1 == "*") or (t2 == "*") or (not t1) or (not t2) { return True; }
+    return t1 == t2;
+}
+
+def _effect_pair_conflicts(e1: dict[str, str], e2: dict[str, str]) -> bool {
+    k1 = e1["kind"];
+    k2 = e2["kind"];
+    if (k1 == "pure") or (k2 == "pure") { return False; }
+    if (k1 == "proc") or (k2 == "proc") { return True; }
+    if k1 != k2 { return False; }
+    if (e1["mode"] == "read") and (e2["mode"] == "read") { return False; }
+    return _targets_alias(e1["target"], e2["target"]);
+}
+
+def _effects_conflict(effs1: list[dict[str, str]], effs2: list[dict[str, str]]) -> str {
+    for e1 in effs1 {
+        for e2 in effs2 {
+            if _effect_pair_conflicts(e1, e2) {
+                s1 = e1["kind"] + ":" + e1["mode"] + ("(" + e1["target"] + ")" if e1["target"] else "");
+                s2 = e2["kind"] + ":" + e2["mode"] + ("(" + e2["target"] + ")" if e2["target"] else "");
+                return s1 + " vs " + s2;
+            }
+        }
+    }
+    return "";
 }
 
 def _trans_deps(nid: str, deps: dict[str, any], memo: dict[str, any]) -> list[any] {
@@ -194,6 +339,26 @@ def extract_concurrency(ir: any) -> dict[str, any] {
     by_id: dict[str, any] = {};
     for n in nodes { by_id[str(_dct(n).get("id", ""))] = n; }
     deps = _data_deps(ir);
+    effs: dict[str, list[dict[str, str]]] = {};
+    for n in nodes {
+        effs[str(_dct(n).get("id", ""))] = _node_effects(n, ir);
+    }
+    segs = _chain_segments(ir);
+    for seg in segs {
+        slist = _slist(seg);
+        for i in range(len(slist)) {
+            u = slist[i];
+            for j in range(i + 1, len(slist)) {
+                v = slist[j];
+                if _effects_conflict(effs.get(u, []), effs.get(v, [])) {
+                    cur_deps = _lst(deps.get(v));
+                    if u not in cur_deps {
+                        deps[v] = cur_deps + [u];
+                    }
+                }
+            }
+        }
+    }
     memo: dict[str, any] = {};
     spawn_decl = _dct(_dct(ir).get("concurrency"));
     spawn_state = str(spawn_decl.get("spawn", "none"));
@@ -205,19 +370,17 @@ def extract_concurrency(ir: any) -> dict[str, any] {
     dlp: list = [];
 
     # ---- ILP: stage-pack every linear chain segment -------------------------
-    for seg in _chain_segments(ir) {
+    for seg in segs {
         for st in _pack_stages(_lst(seg), deps, memo) {
             stg = _slist(st);
             stages.append(stg);
             if len(stg) < 2 { continue; }
-            acts = [x for x in stg if _ntype(by_id.get(x, {})) == "ACT"];
-            caution = " (>=2 ACT nodes — verify write isolation before lowering)" if len(acts) >= 2 else "";
-            note: str = "G6_PAR: nodes [" + ", ".join(stg) + "] are sequential in the CFG but share no data dependency — parallelizable stage (flow/wait)";
+            note: str = "G6_PAR: nodes [" + ", ".join(stg) + "] are sequential in the CFG but share no data or effect dependency — parallelizable stage (flow/wait)";
             if spawn_state == "none" {
                 why = (" spawn_note: '" + spawn_reason[:80] + "'") if spawn_reason else " (concurrency declared none)";
                 note = note + ";" + why;
             }
-            opportunities.append(note + caution);
+            opportunities.append(note);
         }
     }
 
@@ -244,6 +407,9 @@ def extract_concurrency(ir: any) -> dict[str, any] {
                 if (cnt > 1) and (x not in shared) { shared.append(x); }
             }
         }
+        nconc = _dct(_dct(n).get("concurrency"));
+        iso = str(nconc.get("isolation") or _dct(n).get("isolation") or "shared_read").lower();
+        write_isolated = iso in ["private_write", "worktree"];
         for i in range(len(branches)) {
             for j in range(len(branches)) {
                 if i == j { continue; }
@@ -258,6 +424,15 @@ def extract_concurrency(ir: any) -> dict[str, any] {
                                     + "' is written in branch '" + str(branches[i]) + "' (node '" + str(an)
                                     + "') and read in branch '" + str(branches[j]) + "' (node '" + str(bn)
                                     + "'). False parallelism: hoist the carry to the orchestrator or serialize the branches (A.6 read-shared/write-isolated).");
+                            }
+                        }
+                        if (i < j) and (not write_isolated) {
+                            e_conflict = _effects_conflict(effs.get(str(an), []), effs.get(str(bn), []));
+                            if e_conflict {
+                                issues.append("G6_PAR: PARALLEL '" + sid + "' branches have conflicting side effects (" + e_conflict
+                                    + ") between branch '" + str(branches[i]) + "' (node '" + str(an)
+                                    + "') and branch '" + str(branches[j]) + "' (node '" + str(bn)
+                                    + "'). False parallelism: isolate writes (private_write/worktree) or serialize the branches.");
                             }
                         }
                     }

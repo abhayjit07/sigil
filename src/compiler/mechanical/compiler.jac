@@ -22,6 +22,7 @@ import os;
 import re;
 import from .toolib { builtin, builtin_names, builtin_catalogue }
 import from .envbind { extract_manifest, preflight_src, runpy_src, exec_subprocess_tools }
+import from .concurrency { extract_concurrency }
 import from ...sigil_agir_yaml { load_agir }
 import from ...sigil_ais { PSEUDO_TOOLS }
 import glob as _glob;
@@ -2430,7 +2431,82 @@ def _emit_walker(ir: any) -> list[any] {
         join_indeg[_jid] = "max(1, " + _j(" + ", _parts) + ")";
     }
 
-    spawn_sibs: list[any] = [];   # [[sibling_walker_name, worker_slot_name], …] emitted after the main walker
+def _stage_call_info(n: dict[str, any], ir: any, carries: dict[str, any], types: any, code_owned: list[any]) -> dict[str, any] {
+    nid = str(n.get("id") or "");
+    ntype = str(n.get("type") or "");
+    reads = _list(n.get("reads"));
+    writes = _list(n.get("writes"));
+    ckeys = set(carries.keys());
+    if len(writes) > 1 { return {}; }
+    if ("script" in reads) or ("script" in writes) { return {}; }
+    # Require all carry reads to be scalar (str/int/float/bool) so Jac >=0.37
+    # `flow` sendability (imm/scalar) is guaranteed without `E1308`.
+    for r in reads {
+        if r in ckeys {
+            jt = str(_jac_type(carries[r].get("type"), types)[0]);
+            if jt not in ["str", "int", "float", "bool"] { return {}; }
+        }
+    }
+    tgt = str(writes[0]) if writes else "";
+    if tgt and (tgt not in ckeys) { return {}; }
+    if tgt and (tgt in code_owned) { return {}; }
+    is_str = True;
+    if tgt and (tgt in ckeys) {
+        is_str = (str(_jac_type(carries[tgt].get("type"), types)[0]) == "str");
+    }
+    if ntype in GEN_TYPES {
+        if (str(n.get("from_legacy") or "") == "CALL") { return {}; }
+        if _extractor_writes(n, carries, types) { return {}; }
+        slot = _slot_name(nid, carries);
+        kn_dict = _dict(ir.get("knowledge"));
+        kreads = [k for k in reads if k in list(kn_dict.keys())];
+        creads = [r for r in reads if r in ckeys][:SLOT_ARITY_CAP];
+        if (not creads) and (not kreads) and ("task" in ckeys) { creads = ["task"]; }
+        sargs = _slot_args(creads + kreads, carries, types);
+        return {"expr": f"{slot}({sargs})", "tgt": tgt, "is_str": is_str};
+    }
+    if ntype in ["COMPUTE", "OBSERVE", "ACT"] {
+        st = _node_tool(ir, nid, n);
+        if not st { return {}; }
+        wt = tgt if tgt else "artifact";
+        expr = _toolfn_prefix(str(st[0])) + "(" + _bind_args(st[1], reads, carries, types, wt) + ")";
+        return {"expr": expr, "tgt": tgt, "is_str": is_str};
+    }
+    return {};
+}
+
+    # Effect-safe ILP stages from concurrency.jac (each stage >=2 with all
+    # nodes eligible lowers via flow/wait at the stage head).
+    ilp_heads: dict[str, list[dict[str, any]]] = {};
+    ilp_followers: set[str] = set();
+    by_nid_map: dict[str, dict[str, any]] = {};
+    for n0 in _list(ir.get("nodes")) {
+        if isinstance(n0, dict) and n0.get("id") { by_nid_map[str(n0["id"])] = n0; }
+    }
+    _conc_info = extract_concurrency(ir);
+    for stg in _list(_conc_info.get("stages")) {
+        sids = [str(x) for x in _list(stg)];
+        if len(sids) < 2 { continue; }
+        infos: list[dict[str, any]] = [];
+        ok_stg = True;
+        for sid0 in sids {
+            nd0 = by_nid_map.get(sid0);
+            if nd0 is None { ok_stg = False; break; }
+            ci = _stage_call_info(nd0, ir, carries, types, code_owned);
+            if not ci { ok_stg = False; break; }
+            ci["nid"] = sid0;
+            infos.append(ci);
+        }
+        if ok_stg and (len(infos) >= 2) {
+            ilp_heads[sids[0]] = infos;
+            for sid_f in sids[1:] { ilp_followers.add(sid_f); }
+        }
+    }
+    if ilp_heads {
+        out.append("    has _stage_done: dict[str, bool] = {};");
+    }
+
+    spawn_sibs: list[any] = [];   # [[sibling_walker_name, worker_slot_name, write_isolated], …] emitted after the main walker
     for n in _list(ir.get("nodes")) {
         if not isinstance(n, dict) { continue; }
         nid = n["id"];
@@ -2456,7 +2532,30 @@ def _emit_walker(ir: any) -> list[any] {
 
         body: list[any] = [];
         can_dispatch = ("args" in ckeys) and (route_field in ckeys);
-        if (ntype == "DELEGATE") and (str(n.get("from_legacy") or "") == "CALL") {
+        if str(nid) in ilp_heads {
+            _stg_infos = ilp_heads[str(nid)];
+            body.append(f"        # Effect-safe ILP stage {[x['nid'] for x in _stg_infos]} (flow/wait)");
+            for _si in range(len(_stg_infos)) {
+                _inf = _stg_infos[_si];
+                body.append(f"        _ilp_f{_si} = flow {_inf['expr']};");
+            }
+            for _si in range(len(_stg_infos)) {
+                _inf = _stg_infos[_si];
+                _wtgt = str(_inf.get("tgt") or "");
+                if _wtgt {
+                    if _inf.get("is_str") {
+                        body.append(f"        self.{_safe(_wtgt)} = str(wait _ilp_f{_si});");
+                    } else {
+                        body.append(f"        self.{_safe(_wtgt)} = wait _ilp_f{_si};");
+                    }
+                } else {
+                    body.append(f"        _ilp_r{_si} = wait _ilp_f{_si};");
+                }
+            }
+            for _inf_f in _stg_infos[1:] {
+                body.append(f"        self._stage_done[{_q(str(_inf_f['nid']))}] = True;");
+            }
+        } elif (ntype == "DELEGATE") and (str(n.get("from_legacy") or "") == "CALL") {
             # A DELEGATE lifted from a legacy CALL: the sub-agent slot over the
             # caller's carries, then — when the module authors a program — exec the
             # produced script into the target's artifact carry, as CALL always did.
@@ -2792,9 +2891,10 @@ def _emit_walker(ir: any) -> list[any] {
             # I/O-bound worker cognition; N workers finish in ~1x wall-clock, not Nx.
             sib_name = str(name) + _camel(nid) + "Sib";   # name is already CamelCase
             worker = _spawn_worker(nid);
-            spawn_sibs.append([sib_name, worker]);
             conc = _dict(n.get("concurrency"));
-            iso = str(conc.get("isolation") or "shared_read");
+            iso = str(conc.get("isolation") or n.get("isolation") or "shared_read");
+            iso_write = iso.lower() in ["private_write", "worktree"];
+            spawn_sibs.append([sib_name, worker, iso_write]);
             # Fan-out source: a list-typed read carry (data-parallel) > a literal
             # concurrency.spawn list (fixed branches) > the task itself (degenerate).
             list_src = "";
@@ -2808,9 +2908,13 @@ def _emit_walker(ir: any) -> list[any] {
             } else {
                 tasks_expr = "[self.task]";
             }
-            body.append(f"        # PARALLEL {nid}: fan out workers concurrently (isolation: {iso}; siblings write-isolated by idx, worktree isolation deferred to host runtime)");
+            body.append(f"        # PARALLEL {nid}: fan out workers concurrently (isolation: {iso})");
             body.append(f"        _tasks = {tasks_expr};");
-            body.append(f"        _futs = [flow (root spawn {sib_name}(task=_t, idx=_i)) for (_i, _t) in enumerate(_tasks)];");
+            if iso_write {
+                body.append(f"        _futs = [flow (root spawn {sib_name}(task=_t, idx=_i, workdir=f\".sigil_par_{{_i}}\")) for (_i, _t) in enumerate(_tasks)];");
+            } else {
+                body.append(f"        _futs = [flow (root spawn {sib_name}(task=_t, idx=_i)) for (_i, _t) in enumerate(_tasks)];");
+            }
             body.append("        _sibs = [wait _f for _f in _futs];");
             agg = str(writes[0]) if writes else "";
             if agg and (agg in ckeys) {
@@ -2873,6 +2977,12 @@ def _emit_walker(ir: any) -> list[any] {
             _gbody.append("        }");
             body = _gbody;
         }
+        if str(nid) in ilp_followers and body and (not has_flow) {
+            _fbody: list[any] = [f"        if not self._stage_done.get({_q(str(nid))}, False) {{"];
+            for _bl in body { _fbody.append("    " + str(_bl).replace("\n", "\n    ")); }
+            _fbody.append("        }");
+            body = _fbody;
+        }
         # Nodes that didn't emit their own flow (everything but ROUTE/TERMINAL) get
         # guard-aware OSP flow: guarded edges -> conditional visits, total else, and
         # no unconditional self-loop.
@@ -2892,11 +3002,17 @@ def _emit_walker(ir: any) -> list[any] {
         out.append(f"walker {spp[0]} {{");
         out.append("    has task: str;");
         out.append("    has idx: int = 0;");
+        out.append("    has workdir: str = \"\";");
         out.append("    has result: str = \"\";");
         out.append("    has ok: bool = True;");
         out.append("    can run with Root entry {");
         out.append("        try {");
-        out.append(f"            self.result = str({spp[1]}(self.task));");
+        out.append("            _wtask = self.task;");
+        out.append("            if self.workdir {");
+        out.append("                os.makedirs(self.workdir, exist_ok=True);");
+        out.append("                _wtask = f\"[isolated workdir: {self.workdir}] \" + _wtask;");
+        out.append("            }");
+        out.append(f"            self.result = str({spp[1]}(_wtask));");
         out.append("        } except Exception as _e {");
         out.append("            self.result = \"spawn worker error: \" + str(_e)[:200];");
         out.append("            self.ok = False;");
